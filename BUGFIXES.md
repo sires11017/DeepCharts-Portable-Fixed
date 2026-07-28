@@ -41,3 +41,16 @@ What stopped the original DeepCharts-Portable from working on a clean PC, and wh
 - Binaries are unsigned → SmartScreen / antivirus may warn (it installs a root cert and redirects a data feed — inherently "suspicious" to heuristics). Allow it if prompted.
 - The CQG **demo** login built into the closed-source bridge can expire. If the feed won't connect, set your own in `proxy/mitm/.env` (`CQG_USERNAME` / `CQG_PASSWORD`).
 - The mock history server can't fully parse every request shape (`bars=False` in some cases); in practice the real bars come from CQG's own stream, so this isn't blocking.
+
+## Fresh-PC hardening (making it bulletproof to share)
+
+A deep audit of the whole install→launch flow on a *clean* PC (no dev tools, no prior runtimes) found the real reasons it failed for other people. All fixed:
+
+- **Missing runtimes = "launcher runs but the chart never opens."** The chart engine uses **SlimDX**, which needs **DirectX 9** (`d3dx9_43`, `d3dx10_43`, `d3dx11_43`, `d3dcompiler_43`) and the **Visual C++ Redistributables** (2010 `msvcr100` + 2015–2022 `vcruntime140`). A clean Windows 10/11 has none of these, so `Deepchart.Core.exe` crashed instantly with no window. **Fix:** the DirectX `_43` DLLs are shipped next to the app, and the VC++ redists are bundled and installed silently by `Install.ps1`. Nobody downloads anything.
+- **The launcher never checked the engine came up** (the liveness check was gated to a code path that never runs here), so every runtime gap read as a silent "started successfully" with no chart. **Fix:** `Launcher.cs` now verifies `Deepchart.Core` stayed alive and shows a plain-English dialog naming the likely missing runtime.
+- **Installer silent half-failures.** The CA step was a blind 7-second wait (too short on a fresh PC where Defender scans the unsigned proxy for 15–40s), the elevated window vanished on any error, and cert-trust/robocopy results were never checked. **Fix:** `Install.ps1` polls for the CA (~45s, with a retry), verifies the cert was trusted, verifies every exe survived the copy, adds a Defender exclusion, keeps the window open on any error, and writes `C:\Deepchart\install-log.txt`.
+- **Feed reliability.** The live CQG IP is now resolved at install time (via public DNS, before the hosts redirect) and baked into a machine env var; the proxy + history server bind to `127.0.0.1` and get pre-approved firewall rules, so there are no extra "Allow access?" pop-ups and no LAN exposure.
+- **Launcher startup timing.** The 30-second port wait aborted (and tore everything down) on a slow first run; raised to 120s and it no longer kills the proxies if they're still coming up.
+- **CQG status light** now matches the proxy's actual success log line, so a connected feed shows green instead of a permanent (misleading) red.
+
+**Honest ceiling:** the app is unsigned, so **Smart App Control** (default-on on some new Win11 machines) blocks it outright with no "Run anyway" — the only clean fix is code-signing with a paid certificate.

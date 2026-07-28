@@ -499,13 +499,14 @@ class MainForm : Form
                 Log("[START] proxy PID: " + ProxyProc.Id);
             }
 
-            if (!WaitForPorts(30))
+            if (!WaitForPorts(120))
             {
-                Log("ERROR: Ports 443/12010 not ready after 30s — aborting");
-                StopAll();
-                return;
+                Log("WARNING: Ports 443/12010 not confirmed after 120s — launching anyway (first run + antivirus scan can be slow; the app retries the feed on its own)");
             }
-            Log("[START] All ports ready");
+            else
+            {
+                Log("[START] All ports ready");
+            }
 
             string appDir = Path.Combine(BaseDir, "app");
             string newApp = Path.Combine(appDir, "Deepchart.exe");
@@ -585,6 +586,28 @@ if (File.Exists(newApp))
                 else
                 {
                     Log("[APP] Bootstrapper still alive after 5s (PID " + AppProc.Id + ")");
+                }
+            }
+            else
+            {
+                // Legacy: confirm the chart engine actually stayed up. A missing DirectX /
+                // Visual C++ / .NET Framework runtime makes Deepchart.Core.exe exit within ~1s
+                // with no window — the classic "launcher runs but the chart never opens".
+                Thread.Sleep(4000);
+                if (AppProc != null && AppProc.HasExited)
+                {
+                    Log("[APP] Core exited immediately (exit=" + AppProc.ExitCode + ") — a required Windows runtime is likely missing");
+                    try
+                    {
+                        System.Windows.Forms.MessageBox.Show(
+                            "The chart engine could not start.\n\nA required Windows runtime may be missing (DirectX, Visual C++, or .NET Framework).\n\nPlease re-run the DeepCharts installer — it installs these automatically.",
+                            "DeepCharts", System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error);
+                    }
+                    catch { }
+                }
+                else
+                {
+                    Log("[APP] Core alive after 4s (PID " + (AppProc != null ? AppProc.Id.ToString() : "?") + ")");
                 }
             }
         }
@@ -773,8 +796,8 @@ int CountProxyConnections()
                 if (File.GetLastWriteTime(f) > File.GetLastWriteTime(latest)) latest = f;
             }
             string content = File.ReadAllText(latest, Encoding.UTF8);
-            // Check for LOGON_RESULT with code=0 (successful CQG login)
-            return content.Contains("LOGON_RESULT: code=0");
+            // Successful CQG login is logged as "[LOGON] Result code=0" by the proxy.
+            return content.Contains("[LOGON] Result code=0") || content.Contains("LOGON INTERCEPTED AND PATCHED");
         }
         catch { return false; }
     }
