@@ -92,13 +92,19 @@ Set-ItemProperty -Path "HKCU:\Software\DeepCharts" -Name InstallPath -Value $app
 # ---- 7. shortcuts + launch ----
 Write-Host "[7/7] Creating shortcut and launching..." -ForegroundColor White
 $wsh = New-Object -ComObject WScript.Shell
-foreach ($dir in @([Environment]::GetFolderPath('Desktop'), "$env:ProgramData\Microsoft\Windows\Start Menu\Programs")) {
+$shortcutDirs = @([Environment]::GetFolderPath('Desktop'), "$env:PUBLIC\Desktop", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs")
+foreach ($dir in ($shortcutDirs | Select-Object -Unique)) {
     try {
-        $lnk = $wsh.CreateShortcut((Join-Path $dir "DeepCharts.lnk"))
+        $lnkPath = Join-Path $dir "DeepCharts.lnk"
+        $lnk = $wsh.CreateShortcut($lnkPath)
         $lnk.TargetPath = "$appRoot\Deepchart.exe"
         $lnk.WorkingDirectory = $appRoot
         if (Test-Path "$appRoot\app\deepchart_icon_dark.ico") { $lnk.IconLocation = "$appRoot\app\deepchart_icon_dark.ico" }
         $lnk.Save()
+        # mark the shortcut "Run as administrator" (the launcher needs elevation to manage the proxies)
+        $lb = [IO.File]::ReadAllBytes($lnkPath)
+        $lb[0x15] = $lb[0x15] -bor 0x20
+        [IO.File]::WriteAllBytes($lnkPath, $lb)
     } catch {}
 }
 Start-Process "$appRoot\Deepchart.exe" -WorkingDirectory $appRoot
