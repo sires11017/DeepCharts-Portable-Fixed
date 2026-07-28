@@ -12,8 +12,32 @@ using System.Windows.Forms;
 class DeepChartsApp
 {
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
+        // Ensure we run elevated (the launcher needs admin to manage the local proxies + ports).
+        // The desktop shortcut is marked run-as-admin, so normally we're already elevated and skip this.
+        // The "--elevated" marker on the relaunch guarantees we never loop even if the check misreads.
+        bool alreadyElevated = false;
+        if (args != null) { foreach (string a in args) { if (a == "--elevated") alreadyElevated = true; } }
+        if (!alreadyElevated)
+        {
+            try
+            {
+                System.Security.Principal.WindowsIdentity wid = System.Security.Principal.WindowsIdentity.GetCurrent();
+                System.Security.Principal.WindowsPrincipal wp = new System.Security.Principal.WindowsPrincipal(wid);
+                if (!wp.IsInRole(544))  // 544 = built-in Administrators RID; true only when elevated
+                {
+                    ProcessStartInfo elev = new ProcessStartInfo(Application.ExecutablePath);
+                    elev.Arguments = "--elevated";
+                    elev.UseShellExecute = true;
+                    elev.Verb = "runas";
+                    try { Process.Start(elev); } catch { /* user cancelled UAC */ }
+                    return;
+                }
+            }
+            catch { }
+        }
+
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         bool firstCreated;
@@ -53,6 +77,7 @@ class MainForm : Form
     Button BtnStop;
     Button BtnCred;
     bool Running;
+    volatile bool _starting;   // re-entrancy guard: true while a start sequence is in progress
     string SavedUser;
     string SavedPass;
     string LastLogPath;
@@ -369,7 +394,8 @@ class MainForm : Form
 
     void BtnStart_Click(object sender, EventArgs e)
     {
-        Thread startThread = new Thread(StartAll);
+        if (Running || _starting) { Log("[START] Already running or starting — ignoring duplicate click"); return; }
+        Thread startThread = new Thread(delegate() { _starting = true; try { StartAll(); } finally { _starting = false; } });
         startThread.IsBackground = true;
         startThread.Start();
     }
@@ -383,12 +409,17 @@ class MainForm : Form
 
     void AutoStart()
     {
-        Thread.Sleep(500);
-        if (!string.IsNullOrEmpty(SavedUser))
-            Log("Credentials saved for: " + SavedUser);
-        KillOld();
-        Thread.Sleep(2000);
-        StartAll();
+        _starting = true;
+        try
+        {
+            Thread.Sleep(500);
+            if (!string.IsNullOrEmpty(SavedUser))
+                Log("Credentials saved for: " + SavedUser);
+            KillOld();
+            Thread.Sleep(2000);
+            StartAll();
+        }
+        finally { _starting = false; }
     }
 
     void KillOld()
@@ -435,6 +466,7 @@ class MainForm : Form
         if (!useBundles && !useScripts)
         {
             Log("ERROR: No proxy found (bundles or scripts)");
+            try { MessageBox.Show("DeepCharts data-engine files are missing (antivirus may have removed them).\n\nPlease re-run the DeepCharts installer.", "DeepCharts", MessageBoxButtons.OK, MessageBoxIcon.Error); } catch { }
             return;
         }
 
@@ -475,6 +507,7 @@ class MainForm : Form
                 if (ProxyProc.HasExited)
                 {
                     Log("ERROR: Proxy exited immediately (exit=" + ProxyProc.ExitCode + ") — check logs");
+                    try { MessageBox.Show("The data proxy could not start.\n\nAnother program may be using port 443, or antivirus blocked it. Close other apps and relaunch DeepCharts.", "DeepCharts", MessageBoxButtons.OK, MessageBoxIcon.Warning); } catch { }
                     string logDir = FindLogDir();
                     if (logDir != null)
                     {
@@ -544,6 +577,7 @@ if (File.Exists(newApp))
             else
             {
                 Log("ERROR: No app found in " + appDir);
+                try { MessageBox.Show("The chart application is missing (antivirus may have removed it).\n\nPlease re-run the DeepCharts installer.", "DeepCharts", MessageBoxButtons.OK, MessageBoxIcon.Error); } catch { }
                 StopAll();
                 return;
             }
