@@ -924,14 +924,6 @@ int CountProxyConnections()
         errThread.Start();
         return p;
     }
-                }
-            }
-            catch { }
-        });
-        errThread.IsBackground = true;
-        errThread.Start();
-        return p;
-    }
 
     string FindLogDir()
     {
