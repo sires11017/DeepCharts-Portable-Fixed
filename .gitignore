@@ -1,0 +1,40 @@
+# App binaries ship in Releases, not in the repo
+*.exe
+*.dll
+*.ex4
+*.ex5
+*.zip
+*.7z
+*.mp4
+*.wav
+build/
+dist/
+payload/
+output/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets & per-machine certificates — never commit
+.env
+config_local.py
+certs/
+*.pem
+*.key
+*.pfx
+*.p12
+creds.dat
+.python_path
+
+# Logs & runtime data
+*.log
+logs/
+userdata/Trading Account/
+userdata/Hist Fills/
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vs/
+*.user

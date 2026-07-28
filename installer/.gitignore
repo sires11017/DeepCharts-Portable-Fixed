@@ -1,0 +1,8 @@
+# Inno Setup build artifacts
+payload/
+*.exe
+*.log
+
+# Signing artifacts
+*.pfx
+*.p12

@@ -1,0 +1,85 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# C# source code
+*.cs text eol=crlf
+*.csx text eol=crlf
+
+# PowerShell scripts
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+# Batch files
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python
+*.py text eol=lf
+*.pyw text eol=lf
+
+# Config / data files
+*.xml text
+*.json text
+*.yaml text
+*.yml text
+*.toml text
+*.ini text
+*.cfg text
+*.md text
+*.txt text
+*.csv text
+*.html text
+*.css text
+*.js text
+*.proto text
+
+# Binary files - prevent line-ending conversion
+*.dll binary
+*.exe binary
+*.pdb binary
+*.ilk binary
+*.obj binary
+*.lib binary
+*.exp binary
+*.so binary
+*.dylib binary
+
+# Audio
+*.wav binary
+*.mp3 binary
+*.ogg binary
+
+# Video
+*.mp4 binary
+*.avi binary
+*.mkv binary
+
+# Images
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.bmp binary
+*.svg text
+
+# Certificates / keys
+*.pem binary
+*.key binary
+*.p12 binary
+*.pk12 binary
+*.pfx binary
+*.cer binary
+*.der binary
+
+# Archives
+*.zip binary
+*.7z binary
+*.tar binary
+*.gz binary
+
+# Compressed
+*.gz binary
+*.bz2 binary
+*.xz binary
