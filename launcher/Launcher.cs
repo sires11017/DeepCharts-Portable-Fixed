@@ -437,7 +437,49 @@ class MainForm : Form
                 catch { }
             }
         }
+        // Also free the ports themselves in case a leftover or foreign process is holding them.
+        // IMPORTANT: only kill a process LISTENING on the exact local port (a server) — never a
+        // client connecting out to a remote :443 (that was the old bug that killed Discord/browsers).
+        FreePort(ProxyPort);
+        FreePort(HistPort);
         Thread.Sleep(1000);
+    }
+
+    void FreePort(int port)
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo("netstat", "-ano -p TCP");
+            psi.UseShellExecute = false;
+            psi.RedirectStandardOutput = true;
+            psi.CreateNoWindow = true;
+            Process p = Process.Start(psi);
+            string output = p.StandardOutput.ReadToEnd();
+            p.WaitForExit();
+            string suffix = ":" + port;
+            foreach (string raw in output.Split('\n'))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0) continue;
+                if (line.IndexOf("LISTENING", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                string[] parts = line.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 5) continue;
+                string local = parts[1];               // e.g. 0.0.0.0:443, 127.0.0.1:443, [::]:443
+                if (!local.EndsWith(suffix)) continue; // exact local listening port only
+                int pid;
+                if (!int.TryParse(parts[parts.Length - 1], out pid)) continue;
+                if (pid == LauncherPid || pid == 0) continue;
+                try
+                {
+                    Process holder = Process.GetProcessById(pid);
+                    Log("Freeing port " + port + " — killing listener " + holder.ProcessName + " PID " + pid);
+                    holder.Kill();
+                }
+                catch { }
+            }
+            Thread.Sleep(500);
+        }
+        catch { }
     }
 
     void SetEnv()
