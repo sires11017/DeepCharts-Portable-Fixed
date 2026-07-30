@@ -45,8 +45,8 @@ if (-not [Environment]::Is64BitOperatingSystem) { Fail "This is 32-bit Windows. 
 else { Pass "64-bit Windows." }
 
 # --- 2. runtimes ---
-$dx = @("d3dx9_43.dll","d3dx10_43.dll","d3dx11_43.dll","d3dcompiler_43.dll") | Where-Object { -not (Test-Path "$appRoot\app\$_") }
-if ($dx.Count -gt 0) { Fail ("DirectX helper files missing from the app folder: " + ($dx -join ', ') + " -> re-run the installer.") } else { Pass "DirectX helper DLLs present." }
+$dx = @("d3dx9_43.dll","d3dx10_43.dll","d3dx11_43.dll","d3dcompiler_43.dll") | Where-Object { -not (Test-Path "$appRoot\app\$_") -and -not (Test-Path "$env:WINDIR\System32\$_") }
+if ($dx.Count -gt 0) { Fail ("DirectX helper files not found (in the app folder or Windows): " + ($dx -join ', ') + " -> re-run the installer.") } else { Pass "DirectX helper DLLs available." }
 $rel = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -EA SilentlyContinue).Release
 if (-not $rel -or $rel -lt 528040) { Fail ".NET Framework 4.8 is missing -> re-run the installer or install .NET 4.8." } else { Pass ".NET Framework 4.8 present." }
 $vc = Test-Path "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
@@ -144,11 +144,9 @@ if ((Test-Path $caPath) -and -not $caTrusted) {
         Say "  [FIXED] Re-added the security certificate to the trusted store." Green
     } catch { Say "  [could not re-add certificate - a security policy may block it]" Yellow }
 }
-# our own stale listeners (never foreign)
-foreach ($n in @("DeepChartsProxy","DeepChartsHistServer")) {
-    $procs = Get-Process -Name $n -EA SilentlyContinue
-    if ($procs) { $procs | Stop-Process -Force -EA SilentlyContinue; Say ("  [FIXED] Stopped stale " + $n + " so it can restart cleanly.") Green }
-}
+# NOTE: we deliberately do NOT kill the proxy/hist here - if the app is running fine those are the
+# LIVE processes and killing them would break a working feed. Stale-process cleanup happens safely
+# in the launcher on the next start (FreePort/KillOld). Diagnose only repairs hosts + cert trust.
 if ($hostsOk -and $caTrusted) { Say "  Nothing needed auto-repair." }
 
 Line
