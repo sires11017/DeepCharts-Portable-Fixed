@@ -12,6 +12,16 @@ $dataDir = "C:\Deepchart\data"
 $me = $MyInvocation.MyCommand.Path
 $src = Split-Path -Parent $me
 
+# ---- architecture guard (payload is 64-bit only) ----
+if (-not [Environment]::Is64BitOperatingSystem) {
+    Write-Host ""
+    Write-Host "DeepCharts requires 64-bit Windows." -ForegroundColor Red
+    Write-Host "This PC is running 32-bit Windows and cannot run this app." -ForegroundColor Red
+    Write-Host ""
+    Read-Host "Press Enter to close"
+    exit
+}
+
 # ---- self-elevate (one UAC prompt), gracefully ----
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
@@ -96,6 +106,9 @@ try {
     )
     $missing = @($must | Where-Object { -not (Test-Path $_) })
     if ($missing.Count -gt 0) { throw "Files are missing after copy (antivirus likely removed them): $($missing -join ', '). Add a Defender exclusion for C:\Deepchart and retry." }
+    # drop the Diagnose + Uninstall tools into the install folder, and clear Mark-of-the-Web from everything
+    foreach ($f in @("diagnose.ps1","Diagnose DeepCharts.bat","Uninstall.ps1","Uninstall DeepCharts.bat")) { if (Test-Path "$src\$f") { Copy-Item "$src\$f" "$appRoot\$f" -Force } }
+    try { Get-ChildItem $appRoot -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
 
     # ---- 5. deploy templates to C:\Deepchart\data ----
     Write-Host "[4/9] Loading templates + workspaces..." -ForegroundColor White
@@ -126,9 +139,15 @@ try {
     if (-not (Test-Path "$caDir\ca.pem")) { throw "Certificate generation failed - the security proxy could not start (antivirus may have blocked it). Add a Defender exclusion for C:\Deepchart and retry." }
 
     Write-Host "[6/9] Trusting the certificate..." -ForegroundColor White
+    $caTp = (New-Object Security.Cryptography.X509Certificates.X509Certificate2("$caDir\ca.pem")).Thumbprint
+    # remove any stale same-named CA with a DIFFERENT thumbprint (prevents trust collisions that break TLS)
+    Get-ChildItem Cert:\LocalMachine\Root, Cert:\CurrentUser\Root -ErrorAction SilentlyContinue |
+        Where-Object { ($_.Subject -match 'Bridge MITM CA|DeepCharts MITM CA') -and $_.Thumbprint -ne $caTp } |
+        ForEach-Object { try { Remove-Item $_.PSPath -Force -ErrorAction SilentlyContinue } catch {} }
     & certutil -addstore -f Root "$caDir\ca.pem" | Out-Null
     & certutil -user -addstore -f Root "$caDir\ca.pem" | Out-Null
-    $trusted = @(Get-ChildItem Cert:\LocalMachine\Root, Cert:\CurrentUser\Root -ErrorAction SilentlyContinue | Where-Object { $_.Subject -match 'MITM CA' }).Count -gt 0
+    # verify by THUMBPRINT (a stale same-named cert must not count as success)
+    $trusted = @(Get-ChildItem Cert:\LocalMachine\Root, Cert:\CurrentUser\Root -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $caTp }).Count -gt 0
     if (-not $trusted) { throw "The certificate could not be added to the trusted store (a security policy may be blocking it)." }
 
     # ---- 7. hosts entries (idempotent) ----
@@ -136,19 +155,51 @@ try {
     $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
     $domains = @("demoapi.cqg.com","api.cqg.com","depth-it.historical.deepcharts.com","data-b.historical.deepcharts.com")
     # resolve the REAL CQG IP now (via public DNS, before hosts redirects it) and bake it in
-    try {
-        $cqgip = (Resolve-DnsName -Name "demoapi.cqg.com" -Server 8.8.8.8 -Type A -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -First 1).IPAddress
-        if ($cqgip) { [Environment]::SetEnvironmentVariable("CQG_UPSTREAM_IP", $cqgip, "Machine"); Write-Host "      CQG upstream resolved: $cqgip" }
-    } catch { Write-Host "      (using the built-in CQG address)" -ForegroundColor DarkGray }
-    $existing = @(Get-Content $hostsPath -Encoding ASCII -ErrorAction SilentlyContinue)
+    # resolve the real CQG IP: try the SYSTEM resolver first (works on DNS-locked nets),
+    # then public 8.8.8.8; validate reachability before committing. Runs BEFORE hosts is written.
+    $cqgip = $null
+    foreach ($resolver in @($null, "8.8.8.8")) {
+        try {
+            $rp = @{ Name = "demoapi.cqg.com"; Type = "A"; ErrorAction = "Stop" }
+            if ($resolver) { $rp["Server"] = $resolver }
+            $cand = (Resolve-DnsName @rp | Where-Object { $_.IPAddress -and $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1).IPAddress
+            if ($cand) {
+                $tc = New-Object Net.Sockets.TcpClient; $iar = $tc.BeginConnect($cand, 443, $null, $null)
+                $reach = ($iar.AsyncWaitHandle.WaitOne(3000) -and $tc.Connected); try { $tc.Close() } catch {}
+                if ($reach) { $cqgip = $cand; break } elseif (-not $cqgip) { $cqgip = $cand }
+            }
+        } catch {}
+    }
+    if ($cqgip) { [Environment]::SetEnvironmentVariable("CQG_UPSTREAM_IP", $cqgip, "Machine"); Write-Host "      CQG upstream resolved: $cqgip" }
+    else { Write-Host "      (could not verify the market-data server on this network - the feed may not connect here)" -ForegroundColor DarkYellow }
+    # backup the original hosts file once
+    if (-not (Test-Path "$hostsPath.deepcharts.bak")) { Copy-Item $hostsPath "$hostsPath.deepcharts.bak" -Force -ErrorAction SilentlyContinue }
+    $existing = @(Get-Content $hostsPath -Encoding UTF8 -ErrorAction SilentlyContinue)
     $kept = @($existing | Where-Object {
         $l = $_
         if ($l -match '^\s*#\s*DeepCharts CQG proxy entries') { return $false }
         foreach ($d in $domains) { if ($l -match ("\s" + [regex]::Escape($d) + "(\s|$|#)")) { return $false } }
+        # strip stale FOREIGN redirections of *.cqg.com / *.historical.deepcharts.com (keeps legit 127.0.0.1 lines)
+        if ($l -match '\.cqg\.com(\s|$|#)' -and $l -notmatch '^\s*127\.0\.0\.1') { return $false }
+        if ($l -match 'historical\.deepcharts\.com(\s|$|#)' -and $l -notmatch '^\s*127\.0\.0\.1') { return $false }
         return $true
     })
-    ($kept + @("# DeepCharts CQG proxy entries") + ($domains | ForEach-Object { "127.0.0.1 $_" })) | Set-Content -Path $hostsPath -Encoding ASCII -Force
+    $newHosts = $kept + @("# DeepCharts CQG proxy entries") + ($domains | ForEach-Object { "127.0.0.1 $_" })
+    # atomic write: build a temp file then Replace() so the live hosts is never truncated mid-write
+    try {
+        $tmp = "$hostsPath.dctmp"
+        $newHosts | Set-Content -Path $tmp -Encoding UTF8 -Force
+        [System.IO.File]::Replace($tmp, $hostsPath, "$hostsPath.dcbak2")
+    } catch {
+        try { $newHosts | Set-Content -Path $hostsPath -Encoding UTF8 -Force }
+        catch { throw "Could not update the hosts file (antivirus may be protecting it). Allow the change / add an exclusion, then re-run the installer." }
+    }
     & ipconfig /flushdns | Out-Null
+    # read-back verify (some antivirus silently reverts the hosts file)
+    Start-Sleep -Milliseconds 700
+    $verify = @(Get-Content $hostsPath -Encoding UTF8 -ErrorAction SilentlyContinue)
+    $missingHosts = @($domains | Where-Object { $dd = $_; -not (@($verify | Where-Object { $_ -match ("^\s*127\.0\.0\.1\s+" + [regex]::Escape($dd)) })).Count })
+    if ($missingHosts.Count -gt 0) { throw "Your antivirus is blocking the data-feed setup (the Windows hosts file). Allow the hosts change / add an exclusion, then re-run the installer." }
 
     # ---- 8. machine settings: speed, loopback binding, firewall pre-approval ----
     Write-Host "[8/9] Applying settings..." -ForegroundColor White

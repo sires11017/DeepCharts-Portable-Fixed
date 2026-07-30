@@ -40,6 +40,11 @@ class DeepChartsApp
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        if (!Environment.Is64BitOperatingSystem)
+        {
+            MessageBox.Show("DeepCharts requires 64-bit Windows.\n\nThis PC is running 32-bit Windows and cannot run it.", "DeepCharts", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
         bool firstCreated;
         Mutex mtx = new Mutex(true, "DeepChartsLauncher", out firstCreated);
         if (!firstCreated)
@@ -74,10 +79,12 @@ class MainForm : Form
     Label LblApp;
     Label LblCQG;
     Button BtnStart;
+    Button BtnDiagnose;
     Button BtnStop;
     Button BtnCred;
     bool Running;
     volatile bool _starting;   // re-entrancy guard: true while a start sequence is in progress
+    string _foreignPortHolder = "";  // name of a non-DeepCharts program found holding our port, if any
     string SavedUser;
     string SavedPass;
     string LastLogPath;
@@ -183,9 +190,16 @@ class MainForm : Form
         BtnStart.Height = 32;
         BtnStart.Click += BtnStart_Click;
 
+        BtnDiagnose = new Button();
+        BtnDiagnose.Text = "Diagnose";
+        BtnDiagnose.Width = 100;
+        BtnDiagnose.Height = 32;
+        BtnDiagnose.Click += BtnDiagnose_Click;
+
         btnPanel.Controls.Add(BtnStart);
         btnPanel.Controls.Add(BtnStop);
         btnPanel.Controls.Add(BtnCred);
+        btnPanel.Controls.Add(BtnDiagnose);
         tbl.Controls.Add(btnPanel);
 
         this.Controls.Add(tbl);
@@ -400,6 +414,24 @@ class MainForm : Form
         startThread.Start();
     }
 
+    void BtnDiagnose_Click(object sender, EventArgs e)
+    {
+        try
+        {
+            string ps1 = Path.Combine(BaseDir, "diagnose.ps1");
+            if (!File.Exists(ps1))
+            {
+                MessageBox.Show("The Diagnose tool wasn't found. Please re-run the DeepCharts installer.", "DeepCharts", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            ProcessStartInfo psi = new ProcessStartInfo("powershell.exe", "-NoProfile -ExecutionPolicy Bypass -File \"" + ps1 + "\"");
+            psi.UseShellExecute = true;
+            Process.Start(psi);
+            Log("[DIAGNOSE] launched diagnose.ps1");
+        }
+        catch (Exception ex) { Log("[DIAGNOSE] " + ex.Message); }
+    }
+
     void BtnStop_Click(object sender, EventArgs e)
     {
         Thread stopThread = new Thread(StopAll);
@@ -449,6 +481,7 @@ class MainForm : Form
     {
         try
         {
+            string localSuffix = ":" + port;
             ProcessStartInfo psi = new ProcessStartInfo("netstat", "-ano -p TCP");
             psi.UseShellExecute = false;
             psi.RedirectStandardOutput = true;
@@ -456,28 +489,98 @@ class MainForm : Form
             Process p = Process.Start(psi);
             string output = p.StandardOutput.ReadToEnd();
             p.WaitForExit();
-            string suffix = ":" + port;
             foreach (string raw in output.Split('\n'))
             {
-                string line = raw.Trim();
-                if (line.Length == 0) continue;
-                if (line.IndexOf("LISTENING", StringComparison.OrdinalIgnoreCase) < 0) continue;
-                string[] parts = line.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                string[] parts = raw.Trim().Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                // Row format: TCP  LocalAddr:Port  ForeignAddr:Port  STATE  PID
+                // A LISTENING row is language-independent (netstat's STATE word is localized on
+                // non-English Windows): its FOREIGN address is always *:0. Match on that, not "LISTENING".
                 if (parts.Length < 5) continue;
-                string local = parts[1];               // e.g. 0.0.0.0:443, 127.0.0.1:443, [::]:443
-                if (!local.EndsWith(suffix)) continue; // exact local listening port only
+                if (!parts[0].Equals("TCP", StringComparison.OrdinalIgnoreCase)) continue;
+                string local = parts[1];
+                string foreign = parts[2];
+                if (!local.EndsWith(localSuffix)) continue;   // exact local port
+                if (!foreign.EndsWith(":0")) continue;         // a server/listener — never a client's remote :443
                 int pid;
                 if (!int.TryParse(parts[parts.Length - 1], out pid)) continue;
                 if (pid == LauncherPid || pid == 0) continue;
                 try
                 {
                     Process holder = Process.GetProcessById(pid);
-                    Log("Freeing port " + port + " — killing listener " + holder.ProcessName + " PID " + pid);
-                    holder.Kill();
+                    string pname = holder.ProcessName;
+                    bool ours = pname.IndexOf("DeepChartsProxy", StringComparison.OrdinalIgnoreCase) >= 0
+                             || pname.IndexOf("DeepChartsHistServer", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (ours)
+                    {
+                        Log("Freeing port " + port + " — stopping our stale " + pname + " PID " + pid);
+                        holder.Kill();
+                    }
+                    else
+                    {
+                        // A FOREIGN server holds our port. Do NOT silently kill someone's IIS/nginx/Docker/etc.
+                        Log("WARNING: port " + port + " is held by another program: " + pname + " (PID " + pid + ")");
+                        _foreignPortHolder = pname + " (PID " + pid + ")";
+                    }
                 }
                 catch { }
             }
-            Thread.Sleep(500);
+            // Kill() returns before the OS releases the socket — wait until it's actually free (or give up).
+            for (int i = 0; i < 20 && IsPortOpen(port); i++) { Thread.Sleep(250); }
+        }
+        catch { }
+    }
+
+    void EnsureCaTrust()
+    {
+        try
+        {
+            string caPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DeepCharts", "certs", "mitm_ca", "ca.pem");
+            if (!File.Exists(caPath)) return;  // the proxy regenerates it on first run
+            System.Security.Cryptography.X509Certificates.X509Certificate2 cert = new System.Security.Cryptography.X509Certificates.X509Certificate2(caPath);
+            string tp = cert.Thumbprint;
+            if (IsThumbprintTrusted(tp)) return;
+            Log("[CA] Certificate not trusted — re-adding to the Root store");
+            RunCertutil("-addstore -f Root \"" + caPath + "\"");
+            RunCertutil("-user -addstore -f Root \"" + caPath + "\"");
+            if (!IsThumbprintTrusted(tp))
+            {
+                Log("[CA] Still not trusted after re-add");
+                try { MessageBox.Show("DeepCharts' security certificate is no longer trusted — your antivirus may have removed it.\n\nPlease re-run the DeepCharts installer, or click Diagnose.", "DeepCharts", MessageBoxButtons.OK, MessageBoxIcon.Warning); } catch { }
+            }
+        }
+        catch (Exception ex) { Log("[CA] EnsureCaTrust error: " + ex.Message); }
+    }
+
+    bool IsThumbprintTrusted(string tp)
+    {
+        System.Security.Cryptography.X509Certificates.StoreLocation[] locs = new System.Security.Cryptography.X509Certificates.StoreLocation[] {
+            System.Security.Cryptography.X509Certificates.StoreLocation.LocalMachine,
+            System.Security.Cryptography.X509Certificates.StoreLocation.CurrentUser
+        };
+        foreach (System.Security.Cryptography.X509Certificates.StoreLocation loc in locs)
+        {
+            try
+            {
+                System.Security.Cryptography.X509Certificates.X509Store store = new System.Security.Cryptography.X509Certificates.X509Store(System.Security.Cryptography.X509Certificates.StoreName.Root, loc);
+                store.Open(System.Security.Cryptography.X509Certificates.OpenFlags.ReadOnly);
+                foreach (System.Security.Cryptography.X509Certificates.X509Certificate2 c in store.Certificates)
+                {
+                    if (string.Equals(c.Thumbprint, tp, StringComparison.OrdinalIgnoreCase)) { store.Close(); return true; }
+                }
+                store.Close();
+            }
+            catch { }
+        }
+        return false;
+    }
+
+    void RunCertutil(string args)
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo("certutil", args);
+            psi.UseShellExecute = false; psi.CreateNoWindow = true; psi.RedirectStandardOutput = true; psi.RedirectStandardError = true;
+            Process p = Process.Start(psi); p.StandardOutput.ReadToEnd(); p.WaitForExit();
         }
         catch { }
     }
@@ -541,6 +644,7 @@ class MainForm : Form
                 }
                 Log("[START] HistServer OK — port " + HistPort + " listening: " + IsPortOpen(HistPort));
 
+                EnsureCaTrust();   // re-establish certificate trust if AV/policy broke it since install
                 Log("[START] Proxy bundle: " + proxyBundle);
                 ProxyProc = StartHidden(proxyBundle, "", Path.GetDirectoryName(proxyBundle));
                 Log("[START] Proxy PID: " + ProxyProc.Id);
@@ -549,7 +653,14 @@ class MainForm : Form
                 if (ProxyProc.HasExited)
                 {
                     Log("ERROR: Proxy exited immediately (exit=" + ProxyProc.ExitCode + ") — check logs");
-                    try { MessageBox.Show("The data proxy could not start.\n\nAnother program may be using port 443, or antivirus blocked it. Close other apps and relaunch DeepCharts.", "DeepCharts", MessageBoxButtons.OK, MessageBoxIcon.Warning); } catch { }
+                    try
+                    {
+                        string portMsg = (_foreignPortHolder.Length > 0)
+                            ? ("Port " + ProxyPort + " is being used by another program: " + _foreignPortHolder + ".\n\nPlease close it (or stop that service), then relaunch DeepCharts. Click Diagnose for a full report.")
+                            : ("The data proxy could not start — another program may be using port " + ProxyPort + ", or antivirus blocked it.\n\nClose other apps and relaunch, or click Diagnose for a full report.");
+                        MessageBox.Show(portMsg, "DeepCharts", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                    catch { }
                     string logDir = FindLogDir();
                     if (logDir != null)
                     {
@@ -872,8 +983,10 @@ int CountProxyConnections()
                 if (File.GetLastWriteTime(f) > File.GetLastWriteTime(latest)) latest = f;
             }
             string content = File.ReadAllText(latest, Encoding.UTF8);
-            // Successful CQG login is logged as "[LOGON] Result code=0" by the proxy.
-            return content.Contains("[LOGON] Result code=0") || content.Contains("LOGON INTERCEPTED AND PATCHED");
+            // Green ONLY on a genuinely successful CQG logon. "[LOGON] Result code=0" is the real
+            // success marker; the "PATCHED" line fires even when the logon is then REJECTED (e.g. the
+            // built-in demo account expired), so it must NOT count as connected — that was a false-green.
+            return content.Contains("[LOGON] Result code=0");
         }
         catch { return false; }
     }
